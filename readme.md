@@ -33,6 +33,9 @@ pip install git+https://github.com/vladkens/twscrape.git
 - Saving/restoring account sessions
 - Raw Twitter API responses & SNScrape models
 - Automatic account switching to smooth Twitter API rate limits
+- Direct messages (DM) support
+- Media upload support for tweets and DMs
+- Account status monitoring
 
 ## Usage
 
@@ -104,6 +107,32 @@ async def main():
     await gather(api.trends("news"))  # list[Trend]
     await gather(api.trends("sport"))  # list[Trend]
     await gather(api.trends("VGltZWxpbmU6DAC2CwABAAAACHRyZW5kaW5nAAA"))  # list[Trend]
+    
+    # Send direct message (DM)
+    # 123456789 is the user ID of the recipient
+    dm_result = await api.dm("Hello from twscrape!", [123456789])
+    print(dm_result)
+    
+    # Send DM with media
+    dm_with_media = await api.dm("Check this image!", [123456789], media="path/to/image.jpg")
+    print(dm_with_media)
+    
+    # Upload media for other purposes
+    media_id = await api._upload_media("path/to/image.jpg")
+    print(f"Uploaded media ID: {media_id}")
+    
+    # Add alternative text to media
+    alt_text_result = await api._add_alt_text(media_id, "Description of the image")
+    print(alt_text_result)
+    
+    # Check account status
+    status = await api.account_status()
+    print(f"Total accounts: {status['total']}")
+    print(f"Active accounts: {status['active']}")
+    print(f"Locks: {status['locks']}")
+    
+    # Reset account locks if needed
+    await api.reset_locks()
 
     # NOTE 1: gather is a helper function to receive all data as list, FOR can be used as well:
     async for tweet in api.search("elon musk"):
@@ -342,3 +371,125 @@ API data limitations:
 - [twitter-api-client](https://github.com/trevorhobenshield/twitter-api-client) – Implementation of Twitter's v1, v2, and GraphQL APIs
 - [snscrape](https://github.com/JustAnotherArchivist/snscrape) – is a scraper for social networking services (SNS)
 - [twint](https://github.com/twintproject/twint) – Twitter Intelligence Tool
+
+## 新功能
+
+### 私信和媒体上传
+
+现在可以使用以下方法发送私信和上传媒体文件：
+
+```python
+# 发送简单私信
+await api.dm(text="你好", receivers=[1234567890])
+
+# 发送带图片的私信
+await api.dm(text="查看这张图片", receivers=[1234567890], media="path/to/image.jpg")
+
+# 内部上传媒体API（通常不需要直接调用）
+media_id = await api._upload_media(filename="path/to/media.jpg", is_dm=False)
+
+# 添加参数wait_for_account=True可以在没有可用账号时等待
+await api.dm(text="你好", receivers=[1234567890], wait_for_account=True)
+
+# 检查账号池状态
+account_status = await api.account_status()
+print(f"总账号数: {account_status['total']}")
+print(f"活跃账号数: {account_status['active']}")
+print(f"锁定情况: {account_status['locks']}")
+
+# 重置所有锁
+await api.reset_locks()
+
+# 不支持重置特定队列的锁
+```
+
+上传媒体支持以下格式：
+- 图片：JPG、PNG、GIF等 (最大5MB)
+- 动图：GIF (最大15MB)
+- 视频：MP4等 (最大530MB)
+
+注意：以上API都会自动使用账户池中的账户，并应用代理设置。
+
+#### 常见问题排查
+
+1. 如果收到错误 `AttributeError: 'QueueClient' object has no attribute 'post'`，请确保您使用的是最新版本的twscrape库。旧版本可能存在这个问题。
+
+2. 如果收到错误 `No account available for queue "useSendMessageMutation". Next available at 15:14:23`，表示所有账号都在冷却期。可以选择：
+   - 等待直到指定时间
+   - 添加更多账号到池中：`await api.pool.add_account(email, username, password)`
+   - 使用`wait_for_account=True`参数等待账号可用
+   - 使用`await api.reset_locks()`重置所有锁（谨慎使用，可能导致Twitter限制账号）
+
+3. 如果收到 `403 Forbidden` 错误，可能是账号没有私信权限或媒体上传权限。常见原因：
+   - 新账号可能需要验证手机号才能发送私信
+   - 账号被Twitter限制
+   - 媒体格式不受支持
+   - 目标用户的隐私设置不允许收到私信
+
+4. 为了避免上传错误，请确保：
+   - 媒体文件存在且可读
+   - 文件格式支持且未损坏
+   - 文件大小未超过限制
+   - 您的账号有权限发送私信和上传媒体
+
+5. 如果上传大文件时失败，可以尝试先压缩媒体文件再上传
+
+#### 完整示例：发送私信
+
+以下是一个检查账号状态、重置锁并发送私信的完整示例：
+
+```python
+import asyncio
+from twscrape import API
+
+async def main():
+    # 初始化API
+    api = API("accounts.db")  # 使用已有的账号数据库
+    api.debug = True  # 启用调试模式，查看详细日志
+    
+    # 检查账号状态
+    status = await api.account_status()
+    print(f"总账号数: {status['total']}")
+    print(f"活跃账号数: {status['active']}")
+    
+    if status['total'] == 0:
+        print("没有账号，需要添加账号")
+        await api.pool.add_account("your_email", "your_username", "your_password")
+    
+    # 如果所有账号都被锁定，重置锁
+    if 'useSendMessageMutation' in status['locks']:
+        print("检测到账号被锁定，正在重置...")
+        await api.reset_locks()
+    
+    # 发送私信
+    try:
+        # 不带媒体的私信
+        dm_response = await api.dm(
+            text="你好，这是一条测试消息", 
+            receivers=[1234567890],  # 接收者ID
+            wait_for_account=True  # 如果没有账号可用，等待直到有账号可用
+        )
+        
+        if "error" in dm_response:
+            print(f"发送失败: {dm_response['error']}")
+        else:
+            print("私信发送成功!")
+            
+        # 带媒体的私信
+        dm_with_media = await api.dm(
+            text="查看这张图片", 
+            receivers=[1234567890],
+            media="path/to/image.jpg"
+        )
+        
+        if "error" in dm_with_media:
+            print(f"带媒体的私信发送失败: {dm_with_media['error']}")
+        else:
+            print("带媒体的私信发送成功!")
+            
+    except Exception as e:
+        print(f"发送私信时出错: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```

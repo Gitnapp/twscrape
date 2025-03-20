@@ -186,6 +186,17 @@ class QueueClient:
         if rep.status_code == 200 and "Authorization" in err_msg:
             logger.warning(f"Authorization unknown error: {log_msg}")
             return
+            
+        # Handle DM Errors ---
+        # if rep.status_code == 200 and "data" in res and "create_dm" in res["data"]:
+        #     create_dm = res["data"]["create_dm"]
+        #     if create_dm and create_dm.get("__typename") == "CreateDmFailed":
+        #         failure_type = create_dm.get("dm_validation_failure_type")
+        #         if failure_type == "SenderDoesNotHavePrivilegeToDmRecipient":
+        #             logger.warning(f"Too many DMs sent - {req_id(rep)}")
+        #             # Temp Lock
+        #             await self._close_ctx(utc.ts() + 60 * 60)  # 1 hours
+        #             raise HandledError()
 
         if err_msg != "OK":
             logger.warning(f"API unknown error: {log_msg}")
@@ -195,13 +206,29 @@ class QueueClient:
             rep.raise_for_status()
         except httpx.HTTPStatusError:
             logger.error(f"Unhandled API response code: {log_msg}")
+            logger.error(f"Response: {err_msg}")
             await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
             raise HandledError()
 
     async def get(self, url: str, params: ReqParams = None) -> Response | None:
         return await self.req("GET", url, params=params)
 
-    async def req(self, method: str, url: str, params: ReqParams = None) -> Response | None:
+    async def post(self, url: str, params: ReqParams = None, json: dict = None, files: dict = None, headers: dict = None) -> Response | None:
+        """发送POST请求，支持json和文件上传
+        
+        Args:
+            url: 请求URL
+            params: URL参数
+            json: JSON请求体
+            files: 文件上传
+            headers: 自定义请求头
+            
+        Returns:
+            Response对象或None
+        """
+        return await self.req("POST", url, params=params, json=json, files=files, headers=headers)
+
+    async def req(self, method: str, url: str, params: ReqParams = None, json: dict = None, files: dict = None, headers: dict = None) -> Response | None:
         unknown_retry, connection_retry = 0, 0
 
         while True:
@@ -210,7 +237,20 @@ class QueueClient:
                 return None
 
             try:
-                rep = await ctx.clt.request(method, url, params=params)
+                # 准备请求参数
+                request_kwargs = {"params": params}
+                
+                if json is not None:
+                    request_kwargs["json"] = json
+                
+                if files is not None:
+                    request_kwargs["files"] = files
+                
+                # 添加自定义headers
+                if headers is not None:
+                    request_kwargs["headers"] = headers
+                
+                rep = await ctx.clt.request(method, url, **request_kwargs)
                 setattr(rep, "__username", ctx.acc.username)
                 await self._check_rep(rep)
 

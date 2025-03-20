@@ -175,29 +175,9 @@ class API:
             if method == "GET":
                 return await client.get(f"{GQL_URL}/{op}", params=encode_params(params))
             elif method == "POST":
-                # 直接使用账号的client发送请求，不需要创建新的client
-                account = await self.pool.get_for_queue_or_wait(queue)
-                if not account:
-                    return None
-                
-                try:
-                    # 使用账号的make_client方法确保headers和cookies正确设置
-                    client = account.make_client(proxy=self.proxy)
-                    
-                    # 确保设置正确的headers
-                    headers = client.headers.copy()
-                    headers["content-type"] = "application/json"
-                    
-                    # 发送请求
-                    rep = await client.post(
-                        f"{GQL_URL}/{op}", 
-                        json=params,
-                        headers=headers
-                    )
-                    return rep
-                finally:
-                    await self.pool.unlock(account.username, queue, 1)
-                    await client.aclose()
+                # 使用client.post方法发送POST请求
+                headers = {"content-type": "application/json"}
+                return await client.post(f"{GQL_URL}/{op}", json=params, headers=headers)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
@@ -1010,3 +990,229 @@ class API:
         """
         # 注意：AccountsPool.reset_locks()不接受参数
         return await self.pool.reset_locks()
+
+# Experimental Features -------------------------------------------------------------------------------------------------------------
+
+    async def _upload_media_alt(self, filename: str, is_dm: bool = False, is_profile=False):
+        """使用原生队列管理上传媒体"""
+        queue = "UploadMedia"
+        file = Path(filename)
+        if not file.exists():
+            return None
+        
+        total_bytes = file.stat().st_size
+        media_type = mimetypes.guess_type(file)[0] or 'application/octet-stream'
+        upload_type = 'dm' if is_dm else 'tweet'
+        media_category = f'{upload_type}_gif' if 'gif' in media_type else f'{upload_type}_{media_type.split("/")[0]}'
+        
+        # 检查文件大小
+        def check_media(category: str, size: int) -> None:
+            fmt = lambda x: f'{(x / 1e6):.2f} MB'
+            msg = lambda x: f'cannot upload {fmt(size)} {category}, max size is {fmt(x)}'
+            if category == 'image' and size > MAX_IMAGE_SIZE:
+                raise Exception(msg(MAX_IMAGE_SIZE))
+            if category == 'gif' and size > MAX_GIF_SIZE:
+                raise Exception(msg(MAX_GIF_SIZE))
+            if category == 'video' and size > MAX_VIDEO_SIZE:
+                raise Exception(msg(MAX_VIDEO_SIZE))
+        
+        try:
+            check_media(media_category, total_bytes)
+        except Exception as e:
+            if self.debug:
+                print(f"媒体检查失败: {e}")
+            return None
+        
+        # 使用QueueClient管理账号
+        async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
+            # INIT阶段
+            params = {
+                'command': 'INIT',
+                'media_type': media_type,
+                'total_bytes': total_bytes,
+                'media_category': media_category
+            }
+            
+            url = 'https://upload.twitter.com/1.1/media/upload.json'
+            if is_profile:
+                url = 'https://upload.twitter.com/i/media/upload.json'
+                
+            # 使用POST方法发送INIT请求
+            rep = await client.post(url=url, params=params)
+            if not rep:
+                if self.debug:
+                    print("INIT请求失败")
+                return None
+                
+            try:
+                media_id = rep.json().get('media_id')
+                if not media_id:
+                    if self.debug:
+                        print("无法获取media_id")
+                    return None
+                    
+                # APPEND阶段
+                with open(file, 'rb') as fp:
+                    i = 0
+                    while chunk := fp.read(UPLOAD_CHUNK_SIZE):
+                        files = {'media': chunk}
+                        params = {'command': 'APPEND', 'media_id': media_id, 'segment_index': i}
+                        
+                        rep = await client.post(url=url, params=params, files=files)
+                        if not rep:
+                            if self.debug:
+                                print(f"APPEND段 {i} 失败")
+                            return None
+                        i += 1
+                
+                # FINALIZE阶段
+                params = {'command': 'FINALIZE', 'media_id': media_id}
+                if is_dm:
+                    params |= {'original_md5': hashlib.md5(file.read_bytes()).hexdigest()}
+                    
+                # 使用POST方法发送FINALIZE请求
+                rep = await client.post(url=url, params=params)
+                if not rep:
+                    if self.debug:
+                        print("FINALIZE请求失败")
+                    return None
+                    
+                # 处理视频等需要等待的媒体
+                json_data = rep.json()
+                processing_info = json_data.get('processing_info')
+                
+                while processing_info:
+                    state = processing_info.get('state')
+                    if state == MEDIA_UPLOAD_SUCCEED:
+                        break
+                        
+                    if state == MEDIA_UPLOAD_FAIL:
+                        if self.debug:
+                            print("媒体处理失败")
+                        return None
+                        
+                    check_after_secs = processing_info.get('check_after_secs', 1)
+                    await asyncio.sleep(check_after_secs)
+                    
+                    params = {'command': 'STATUS', 'media_id': media_id}
+                    rep = await client.get(url=url, params=params)
+                    if not rep:
+                        if self.debug:
+                            print("STATUS请求失败")
+                        return None
+                        
+                    processing_info = rep.json().get('processing_info')
+                
+                if self.debug:
+                    print(f"媒体上传成功: {media_id}")
+                return media_id
+                
+            except Exception as e:
+                if self.debug:
+                    print(f"上传媒体时出错: {e}")
+                return None
+
+    async def dm_alt(self, text: str, receivers: list[int] | int | str, media: str = None, wait_for_account=False):
+        """使用GraphQL发送私信的改进方法
+        
+        Args:
+            text: 私信文本内容
+            receivers: 接收者用户ID列表、单个用户ID或字符串形式的ID
+            media: 媒体文件路径(可选)
+            wait_for_account: 如果没有可用账号，是否等待账号可用
+            
+        Returns:
+            响应数据
+        """
+        # 处理接收者ID格式
+        if isinstance(receivers, str):
+            try:
+                receivers = [int(receivers)]
+            except ValueError:
+                return {"error": "接收者ID必须是整数"}
+        elif isinstance(receivers, int):
+            receivers = [receivers]
+        elif not receivers:
+            return {"error": "接收者列表不能为空"}
+        
+        # 确保所有ID都是整数
+        receivers = [int(r) for r in receivers]
+        
+        # 准备GraphQL变量
+        variables = {
+            "message": {"text": {"text": text}},
+            "requestId": str(uuid1(getnode())),
+            "target": {"participant_ids": receivers},
+        }
+        
+        # 处理媒体
+        if media:
+            if self.debug:
+                print(f"开始上传媒体: {media}")
+                
+            media_id = await self._upload_media(media, is_dm=True)
+            if media_id:
+                if self.debug:
+                    print(f"媒体上传成功，ID: {media_id}")
+                variables['message'] = {'media': {'id': media_id, 'text': text}}
+            else:
+                if self.debug:
+                    print("媒体上传失败，将只发送文本消息")
+        
+        # 使用_gql_item发送请求
+        queue = OP_SendMessageMutation.split("/")[-1]
+        
+        try:
+            # 使用QueueClient的POST功能
+            async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
+                if wait_for_account and client.ctx is None:
+                    # 如果需要等待账号，尝试再次获取
+                    next_available = await self.pool.next_available_at(queue)
+                    if self.debug:
+                        print(f"等待账号可用，下一个可用时间: {next_available or '未知'}")
+                    
+                    # 重新尝试获取上下文
+                    await client._get_ctx()
+                    
+                    if client.ctx is None:
+                        return {
+                            "error": f"没有可用的账号发送私信，所有账号都在冷却中。下一个可用时间: {next_available or '未知'}",
+                            "next_available": next_available
+                        }
+                
+                if client.ctx is None:
+                    return {"error": "没有可用的账号发送私信"}
+                
+                if self.debug:
+                    print(f"使用账号 {client.ctx.acc.username} 发送私信")
+                
+                params = {
+                    "variables": variables,
+                    "features": GQL_FEATURES
+                }
+                
+                headers = {"content-type": "application/json"}
+                rep = await client.post(f"{GQL_URL}/{OP_SendMessageMutation}", json=params, headers=headers)
+            
+            # 处理响应
+            if not rep:
+                return {"error": "发送失败: 无响应"}
+                
+            response_data = rep.json()
+            
+            # 检查错误
+            if "errors" in response_data:
+                errors = response_data["errors"]
+                error_messages = "; ".join([f"({e.get('code', 'unknown')}) {e.get('message', 'Unknown error')}" for e in errors])
+                if self.debug:
+                    print(f"发送私信失败: {error_messages}")
+                return {"error": f"发送私信失败: {error_messages}", "raw_response": response_data}
+            
+            if self.debug:
+                print("私信发送成功")
+            return response_data
+            
+        except Exception as e:
+            if self.debug:
+                print(f"发送私信时发生异常: {e}")
+            return {"error": f"发送私信时发生异常: {str(e)}"}

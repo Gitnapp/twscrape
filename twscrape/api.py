@@ -182,7 +182,7 @@ class API:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
     # 媒体上传方法
-    async def _upload_media(self, filename: str, is_dm: bool = False, is_profile=False, max_retries=2) -> int | None:
+    async def _upload_media(self, filename: str, is_dm: bool = False, is_profile=False, max_retries=2, callback_acc=None) -> int | None:
         """
         上传媒体文件到Twitter
         
@@ -191,6 +191,7 @@ class API:
             is_dm: 是否用于私信
             is_profile: 是否用于个人资料
             max_retries: 最大重试次数
+            callback_acc: 指定使用的账号(可选)
             
         Returns:
             media_id: 上传成功后的媒体ID
@@ -231,13 +232,18 @@ class API:
                 print(f"媒体检查失败: {e}")
             return None
 
-        # 尝试多个账号
+        # 尝试指定账号或多个账号
         retries = 0
         last_error = None
         
         while retries <= max_retries:
-            # 使用账号池获取一个可用账号
-            account = await self.pool.get_for_queue_or_wait("UploadMedia")
+            # 使用指定账号或者从账号池获取一个可用账号
+            account = None
+            if callback_acc is not None:
+                account = callback_acc
+            else:
+                account = await self.pool.get_for_queue_or_wait("UploadMedia")
+                
             if not account:
                 if self.debug:
                     print("没有可用的账号进行媒体上传")
@@ -270,6 +276,8 @@ class API:
                     if self.debug:
                         print(f"INIT 阶段失败: {rep.status_code} {rep.text}")
                     last_error = f"INIT失败: {rep.status_code} - {rep.text}"
+                    if callback_acc is not None:
+                        return None  # 如果是指定账号出错，不再重试
                     retries += 1
                     continue
 
@@ -279,12 +287,16 @@ class API:
                         if self.debug:
                             print(f"无法获取media_id, 响应: {rep.text}")
                         last_error = f"无法获取media_id: {rep.text}"
+                        if callback_acc is not None:
+                            return None  # 如果是指定账号出错，不再重试
                         retries += 1
                         continue
                 except Exception as e:
                     if self.debug:
                         print(f"解析media_id失败: {e}, 响应: {rep.text}")
                     last_error = f"解析失败: {e} - {rep.text}"
+                    if callback_acc is not None:
+                        return None  # 如果是指定账号出错，不再重试
                     retries += 1
                     continue
 
@@ -344,6 +356,8 @@ class API:
                     if self.debug:
                         print(f"FINALIZE失败: {rep.status_code} {rep.text}")
                     last_error = f"FINALIZE失败: {rep.status_code} - {rep.text}"
+                    if callback_acc is not None:
+                        return None  # 如果是指定账号出错，不再重试
                     retries += 1
                     continue
 
@@ -358,6 +372,8 @@ class API:
                             if self.debug:
                                 print(f"处理错误: {error}")
                             last_error = f"处理错误: {error}"
+                            if callback_acc is not None:
+                                return None  # 如果是指定账号出错，不再重试
                             retries += 1
                             break
                             
@@ -368,6 +384,8 @@ class API:
                             if self.debug:
                                 print(f"处理失败: {processing_info}")
                             last_error = f"处理失败: {processing_info}"
+                            if callback_acc is not None:
+                                return None  # 如果是指定账号出错，不再重试
                             retries += 1
                             break
                             
@@ -381,6 +399,8 @@ class API:
                             if self.debug:
                                 print(f"STATUS检查失败: {rep.status_code} {rep.text}")
                             last_error = f"STATUS失败: {rep.status_code} - {rep.text}"
+                            if callback_acc is not None:
+                                return None  # 如果是指定账号出错，不再重试
                             retries += 1
                             break
                             
@@ -396,6 +416,8 @@ class API:
                     if self.debug:
                         print(f"处理媒体时发生错误: {e}")
                     last_error = f"处理错误: {e}"
+                    if callback_acc is not None:
+                        return None  # 如果是指定账号出错，不再重试
                     retries += 1
                     continue
                     
@@ -403,10 +425,12 @@ class API:
                 if self.debug:
                     print(f"上传过程中发生错误: {e}")
                 last_error = str(e)
+                if callback_acc is not None:
+                    return None  # 如果是指定账号出错，不再重试
                 retries += 1
             finally:
                 # 结束时确保释放账号和关闭客户端
-                if account:
+                if account and callback_acc is None:  # 只有在不是指定账号时才解锁
                     await self.pool.unlock(account.username, "UploadMedia", 1)
                 if client:
                     await client.aclose()
@@ -464,12 +488,12 @@ class API:
 
         client = None
         try:
-            # 处理媒体上传
+            # 处理媒体上传 - 使用同一账号
             if media:
                 if self.debug:
                     print(f"开始上传媒体: {media}")
                     
-                media_id = await self._upload_media(media, is_dm=True)
+                media_id = await self._upload_media(media, is_dm=True, callback_acc=account)
                 if media_id:
                     if self.debug:
                         print(f"媒体上传成功，ID: {media_id}")
@@ -993,125 +1017,6 @@ class API:
 
 # Experimental Features -------------------------------------------------------------------------------------------------------------
 
-    async def _upload_media_alt(self, filename: str, is_dm: bool = False, is_profile=False):
-        """使用原生队列管理上传媒体"""
-        queue = "UploadMedia"
-        file = Path(filename)
-        if not file.exists():
-            return None
-        
-        total_bytes = file.stat().st_size
-        media_type = mimetypes.guess_type(file)[0] or 'application/octet-stream'
-        upload_type = 'dm' if is_dm else 'tweet'
-        media_category = f'{upload_type}_gif' if 'gif' in media_type else f'{upload_type}_{media_type.split("/")[0]}'
-        
-        # 检查文件大小
-        def check_media(category: str, size: int) -> None:
-            fmt = lambda x: f'{(x / 1e6):.2f} MB'
-            msg = lambda x: f'cannot upload {fmt(size)} {category}, max size is {fmt(x)}'
-            if category == 'image' and size > MAX_IMAGE_SIZE:
-                raise Exception(msg(MAX_IMAGE_SIZE))
-            if category == 'gif' and size > MAX_GIF_SIZE:
-                raise Exception(msg(MAX_GIF_SIZE))
-            if category == 'video' and size > MAX_VIDEO_SIZE:
-                raise Exception(msg(MAX_VIDEO_SIZE))
-        
-        try:
-            check_media(media_category, total_bytes)
-        except Exception as e:
-            if self.debug:
-                print(f"媒体检查失败: {e}")
-            return None
-        
-        # 使用QueueClient管理账号
-        async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
-            # INIT阶段
-            params = {
-                'command': 'INIT',
-                'media_type': media_type,
-                'total_bytes': total_bytes,
-                'media_category': media_category
-            }
-            
-            url = 'https://upload.twitter.com/1.1/media/upload.json'
-            if is_profile:
-                url = 'https://upload.twitter.com/i/media/upload.json'
-                
-            # 使用POST方法发送INIT请求
-            rep = await client.post(url=url, params=params)
-            if not rep:
-                if self.debug:
-                    print("INIT请求失败")
-                return None
-                
-            try:
-                media_id = rep.json().get('media_id')
-                if not media_id:
-                    if self.debug:
-                        print("无法获取media_id")
-                    return None
-                    
-                # APPEND阶段
-                with open(file, 'rb') as fp:
-                    i = 0
-                    while chunk := fp.read(UPLOAD_CHUNK_SIZE):
-                        files = {'media': chunk}
-                        params = {'command': 'APPEND', 'media_id': media_id, 'segment_index': i}
-                        
-                        rep = await client.post(url=url, params=params, files=files)
-                        if not rep:
-                            if self.debug:
-                                print(f"APPEND段 {i} 失败")
-                            return None
-                        i += 1
-                
-                # FINALIZE阶段
-                params = {'command': 'FINALIZE', 'media_id': media_id}
-                if is_dm:
-                    params |= {'original_md5': hashlib.md5(file.read_bytes()).hexdigest()}
-                    
-                # 使用POST方法发送FINALIZE请求
-                rep = await client.post(url=url, params=params)
-                if not rep:
-                    if self.debug:
-                        print("FINALIZE请求失败")
-                    return None
-                    
-                # 处理视频等需要等待的媒体
-                json_data = rep.json()
-                processing_info = json_data.get('processing_info')
-                
-                while processing_info:
-                    state = processing_info.get('state')
-                    if state == MEDIA_UPLOAD_SUCCEED:
-                        break
-                        
-                    if state == MEDIA_UPLOAD_FAIL:
-                        if self.debug:
-                            print("媒体处理失败")
-                        return None
-                        
-                    check_after_secs = processing_info.get('check_after_secs', 1)
-                    await asyncio.sleep(check_after_secs)
-                    
-                    params = {'command': 'STATUS', 'media_id': media_id}
-                    rep = await client.get(url=url, params=params)
-                    if not rep:
-                        if self.debug:
-                            print("STATUS请求失败")
-                        return None
-                        
-                    processing_info = rep.json().get('processing_info')
-                
-                if self.debug:
-                    print(f"媒体上传成功: {media_id}")
-                return media_id
-                
-            except Exception as e:
-                if self.debug:
-                    print(f"上传媒体时出错: {e}")
-                return None
-
     async def dm_alt(self, text: str, receivers: list[int] | int | str, media: str = None, wait_for_account=False):
         """使用GraphQL发送私信的改进方法
         
@@ -1145,25 +1050,11 @@ class API:
             "target": {"participant_ids": receivers},
         }
         
-        # 处理媒体
-        if media:
-            if self.debug:
-                print(f"开始上传媒体: {media}")
-                
-            media_id = await self._upload_media(media, is_dm=True)
-            if media_id:
-                if self.debug:
-                    print(f"媒体上传成功，ID: {media_id}")
-                variables['message'] = {'media': {'id': media_id, 'text': text}}
-            else:
-                if self.debug:
-                    print("媒体上传失败，将只发送文本消息")
-        
-        # 使用_gql_item发送请求
+        # 获取队列名
         queue = OP_SendMessageMutation.split("/")[-1]
         
         try:
-            # 使用QueueClient的POST功能
+            # 先获取账号，确保媒体上传和私信发送使用同一账号
             async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
                 if wait_for_account and client.ctx is None:
                     # 如果需要等待账号，尝试再次获取
@@ -1182,10 +1073,28 @@ class API:
                 
                 if client.ctx is None:
                     return {"error": "没有可用的账号发送私信"}
+                    
+                # 获取当前使用的账号
+                current_account = client.ctx.acc
                 
                 if self.debug:
-                    print(f"使用账号 {client.ctx.acc.username} 发送私信")
+                    print(f"使用账号 {current_account.username} 发送私信")
                 
+                # 处理媒体上传 - 使用同一账号
+                if media:
+                    if self.debug:
+                        print(f"开始上传媒体: {media}")
+                        
+                    media_id = await self._upload_media(media, is_dm=True, callback_acc=current_account)
+                    if media_id:
+                        if self.debug:
+                            print(f"媒体上传成功，ID: {media_id}")
+                        variables['message'] = {'media': {'id': media_id, 'text': text}}
+                    else:
+                        if self.debug:
+                            print("媒体上传失败，将只发送文本消息")
+                
+                # 发送私信
                 params = {
                     "variables": variables,
                     "features": GQL_FEATURES
@@ -1206,8 +1115,16 @@ class API:
                 error_messages = "; ".join([f"({e.get('code', 'unknown')}) {e.get('message', 'Unknown error')}" for e in errors])
                 if self.debug:
                     print(f"发送私信失败: {error_messages}")
-                return {"error": f"发送私信失败: {error_messages}", "raw_response": response_data}
+                return response_data
             
+            # 检查DM创建结果
+            if "data" in response_data and "create_dm" in response_data["data"]:
+                create_dm = response_data["data"]["create_dm"]
+                if create_dm.get("__typename") == "CreateDmFailed":
+                    failure_type = create_dm.get("dm_validation_failure_type", "未知错误")
+                    if self.debug:
+                        print(f"发送失败，响应格式异常: {response_data}")
+                    return response_data
             if self.debug:
                 print("私信发送成功")
             return response_data

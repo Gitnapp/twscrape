@@ -480,6 +480,8 @@ class API:
             else:
                 return {"error": "没有可用的账号发送私信，请添加更多账号。"}
                 
+        print(f"Selected Account: {account.username}")
+
         client = None
         try:
             # 处理媒体上传

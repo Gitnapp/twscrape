@@ -1015,6 +1015,11 @@ class API:
         # 注意：AccountsPool.reset_locks()不接受参数
         return await self.pool.reset_locks()
 
+    async def initialize(self):
+        """初始化API，包括确保数据库表结构正确"""
+        await self.pool.ensure_initialized()
+        return self
+
 # Experimental Features -------------------------------------------------------------------------------------------------------------
 
     async def dm_alt(self, text: str, receivers: list[int] | int | str, media: str = None, wait_for_account=False, return_username=False):

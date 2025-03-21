@@ -3,6 +3,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import TypedDict
+import time
 
 from fake_useragent import UserAgent
 from httpx import HTTPStatusError
@@ -45,6 +46,53 @@ class AccountsPool:
         self._db_file = db_file
         self._login_config = login_config or LoginConfig()
         self._raise_when_no_account = raise_when_no_account
+        self._initialized = False  # 添加初始化标志
+        
+        # 移除asyncio.run调用
+
+    async def ensure_initialized(self):
+        """确保数据库表已初始化"""
+        if not self._initialized:
+            await self._init_custom_limits_tables()
+            self._initialized = True
+            return True
+        return False
+
+    async def _init_custom_limits_tables(self):
+        """初始化自定义限制相关表"""
+        # 自定义限制表
+        await execute(self._db_file, """
+            CREATE TABLE IF NOT EXISTS custom_limits (
+                id INTEGER PRIMARY KEY,
+                queue TEXT,
+                username TEXT DEFAULT '*',
+                hourly_limit INTEGER DEFAULT -1,
+                daily_limit INTEGER DEFAULT -1,
+                UNIQUE(queue, username)
+            )
+        """)
+        
+        # 使用记录表
+        await execute(self._db_file, """
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                id INTEGER PRIMARY KEY,
+                queue TEXT,
+                username TEXT,
+                timestamp INTEGER,
+                req_count INTEGER DEFAULT 1
+            )
+        """)
+        
+        # 创建索引以提高查询性能
+        await execute(self._db_file, """
+            CREATE INDEX IF NOT EXISTS idx_usage_stats_queue_username_timestamp 
+            ON usage_stats(queue, username, timestamp)
+        """)
+        
+        await execute(self._db_file, """
+            CREATE INDEX IF NOT EXISTS idx_custom_limits_queue_username 
+            ON custom_limits(queue, username)
+        """)
 
     async def load_from_file(self, filepath: str, line_format: str):
         line_delim = guess_delim(line_format)
@@ -230,7 +278,7 @@ class AccountsPool:
         """
         await execute(self._db_file, qs, {"username": username})
 
-    async def unlock(self, username: str, queue: str, req_count=0):
+    async def unlock(self, username: str, queue: str, req_count: int = 1):
         qs = f"""
         UPDATE accounts SET
             locks = json_remove(locks, '$.{queue}'),
@@ -239,6 +287,9 @@ class AccountsPool:
         WHERE username = :username
         """
         await execute(self._db_file, qs, {"username": username})
+        
+        # 记录使用量
+        await self.record_usage(queue, username, req_count)
 
     async def _get_and_lock(self, queue: str, condition: str):
         # if space in condition, it's a subquery, otherwise it's username
@@ -270,6 +321,7 @@ class AccountsPool:
         return Account.from_rs(rs) if rs else None
 
     async def get_for_queue(self, queue: str):
+        # 先尝试获取可用账号列表
         q = f"""
         SELECT username FROM accounts
         WHERE active = true AND (
@@ -278,55 +330,230 @@ class AccountsPool:
             OR json_extract(locks, '$.{queue}') < datetime('now')
         )
         ORDER BY {self._order_by}
-        LIMIT 1
         """
-
-        return await self._get_and_lock(queue, q)
-
-    async def get_for_queue_or_wait(self, queue: str) -> Account | None:
-        msg_shown = False
-        while True:
-            account = await self.get_for_queue(queue)
-            if not account:
-                if self._raise_when_no_account or get_env_bool("TWS_RAISE_WHEN_NO_ACCOUNT"):
-                    raise NoAccountError(f"No account available for queue {queue}")
-
-                if not msg_shown:
-                    nat = await self.next_available_at(queue)
-                    if not nat:
-                        logger.warning("No active accounts. Stopping...")
-                        return None
-
-                    msg = f'No account available for queue "{queue}". Next available at {nat}'
-                    logger.info(msg)
-                    msg_shown = True
-
-                await asyncio.sleep(5)
-                continue
-            else:
-                if msg_shown:
-                    logger.info(f"Continuing with account {account.username} on queue {queue}")
-
-            return account
-
-    async def next_available_at(self, queue: str):
-        qs = f"""
-        SELECT json_extract(locks, '$."{queue}"') as lock_until
-        FROM accounts
-        WHERE active = true AND json_extract(locks, '$."{queue}"') IS NOT NULL
-        ORDER BY lock_until ASC
-        LIMIT 1
-        """
-        rs = await fetchone(self._db_file, qs)
-        if rs:
-            now, trg = utc.now(), utc.from_iso(rs[0])
-            if trg < now:
-                return "now"
-
-            at_local = datetime.now() + (trg - now)
-            return at_local.strftime("%H:%M:%S")
-
+        
+        # 获取符合条件的所有账号列表
+        accounts_rs = await fetchall(self._db_file, q)
+        if not accounts_rs:
+            return None
+            
+        # 检查每个账号的自定义限制
+        for acc_row in accounts_rs:
+            username = acc_row["username"]
+            
+            # 检查该账号是否达到限制
+            if await self._check_custom_limits(queue, username):
+                # 通过限制检查，可以使用这个账号
+                return await self._get_and_lock(queue, username)
+                
+        # 所有账号都达到限制
         return None
+        
+    async def _check_custom_limits(self, queue: str, username: str) -> bool:
+        """检查账号在指定队列上是否满足自定义限制
+        
+        Args:
+            queue: 队列名
+            username: 账号用户名
+            
+        Returns:
+            bool: 如果满足限制返回True，否则返回False
+        """
+        # 获取账号的特定限制
+        hourly_limit, daily_limit = await self.get_limit(queue, username)
+        
+        # 获取全局限制(作为备用)
+        global_hourly, global_daily = await self.get_limit(queue)
+        
+        # 使用较小的限制值(如果账号限制是-1表示无限制，则使用全局限制)
+        if hourly_limit == -1 or (global_hourly != -1 and global_hourly < hourly_limit):
+            hourly_limit = global_hourly
+            
+        if daily_limit == -1 or (global_daily != -1 and global_daily < daily_limit):
+            daily_limit = global_daily
+        
+        # 检查限制
+        now = int(time.time())
+        
+        # 如果没有任何限制，直接通过
+        if hourly_limit == -1 and daily_limit == -1:
+            return True
+            
+        # 检查小时限制
+        if hourly_limit != -1:
+            # 查询一小时内的使用量
+            hourly_usage = await self.get_usage(queue, username, 'hourly')
+            if hourly_usage >= hourly_limit:
+                logger.debug(f"账号 {username} 已达到 {queue} 队列的每小时限制: {hourly_usage}/{hourly_limit}")
+                return False
+        
+        # 检查每日限制
+        if daily_limit != -1:
+            # 查询24小时内的使用量
+            daily_usage = await self.get_usage(queue, username, 'daily')
+            if daily_usage >= daily_limit:
+                logger.debug(f"账号 {username} 已达到 {queue} 队列的每日限制: {daily_usage}/{daily_limit}")
+                return False
+                
+        # 通过所有限制检查
+        return True
+        
+    async def set_limit(self, queue: str, hourly_limit: int = -1, daily_limit: int = -1, username: str = '*'):
+        """设置自定义限制
+        
+        Args:
+            queue: 队列名称
+            hourly_limit: 每小时限制(-1表示无限制)
+            daily_limit: 每日限制(-1表示无限制)
+            username: 特定账号(*表示全局限制)
+        """
+        await execute(
+            self._db_file,
+            """INSERT OR REPLACE INTO custom_limits 
+               (queue, username, hourly_limit, daily_limit) VALUES (?, ?, ?, ?)""",
+            (queue, username, hourly_limit, daily_limit)
+        )
+        logger.info(f"为 {queue} 队列设置限制 - 账号: {username}, 小时: {hourly_limit}, 每日: {daily_limit}")
+
+    async def get_limit(self, queue: str, username: str = '*'):
+        """获取限制设置
+        
+        Args:
+            queue: 队列名称
+            username: 账号名(*表示全局限制)
+            
+        Returns:
+            tuple: (hourly_limit, daily_limit)
+        """
+        # 先尝试获取特定账号的限制
+        if username != '*':
+            cursor = await fetchone(
+                self._db_file,
+                "SELECT hourly_limit, daily_limit FROM custom_limits WHERE queue = ? AND username = ?",
+                (queue, username)
+            )
+            if cursor:
+                return cursor["hourly_limit"], cursor["daily_limit"]
+        
+        # 获取全局限制
+        cursor = await fetchone(
+            self._db_file,
+            "SELECT hourly_limit, daily_limit FROM custom_limits WHERE queue = ? AND username = '*'",
+            (queue, )
+        )
+        return (cursor["hourly_limit"], cursor["daily_limit"]) if cursor else (-1, -1)  # 默认无限制
+        
+    async def record_usage(self, queue: str, username: str, req_count: int = 1):
+        """记录队列使用量
+        
+        Args:
+            queue: 队列名称
+            username: 账号名
+            req_count: 请求次数
+        """
+        now = int(time.time())
+        await execute(
+            self._db_file,
+            "INSERT INTO usage_stats (queue, username, timestamp, req_count) VALUES (?, ?, ?, ?)",
+            (queue, username, now, req_count)
+        )
+        
+    async def get_usage(self, queue: str, username: str, window: str = 'hourly'):
+        """查询使用量
+        
+        Args:
+            queue: 队列名称
+            username: 账号名
+            window: 'hourly'或'daily'
+        """
+        now = int(time.time())
+        # 计算时间窗口开始时间
+        if window == 'hourly':
+            # 1小时前
+            start_time = now - 3600
+        elif window == 'daily':
+            # 24小时前
+            start_time = now - 86400
+        else:
+            raise ValueError(f"不支持的时间窗口: {window}")
+            
+        # 查询时间窗口内的使用量
+        cursor = await fetchone(
+            self._db_file,
+            """SELECT SUM(req_count) as total FROM usage_stats 
+               WHERE queue = ? AND username = ? AND timestamp >= ?""",
+            (queue, username, start_time)
+        )
+        return cursor["total"] or 0 if cursor else 0
+        
+    async def cleanup_usage_stats(self, days: int = 7):
+        """清理过期的使用记录
+        
+        Args:
+            days: 保留天数
+        """
+        cutoff = int(time.time()) - (days * 86400)
+        await execute(
+            self._db_file,
+            "DELETE FROM usage_stats WHERE timestamp < ?", 
+            (cutoff,)
+        )
+        logger.info(f"已清理 {days} 天前的使用记录")
+        
+    async def get_usage_stats(self):
+        """获取所有队列的使用统计
+        
+        Returns:
+            dict: 使用统计信息
+        """
+        stats = {}
+        
+        # 获取所有队列
+        queues = await fetchall(self._db_file, "SELECT DISTINCT queue FROM usage_stats")
+        for queue_row in queues:
+            queue = queue_row["queue"]
+            
+            # 获取限制
+            global_hourly, global_daily = await self.get_limit(queue)
+            
+            # 获取账号使用情况
+            accounts = []
+            acc_list = await fetchall(
+                self._db_file,
+                "SELECT DISTINCT username FROM usage_stats WHERE queue = ?", 
+                (queue,)
+            )
+            
+            for acc_row in acc_list:
+                username = acc_row["username"]
+                hourly = await self.get_usage(queue, username, 'hourly')
+                daily = await self.get_usage(queue, username, 'daily')
+                acc_hourly, acc_daily = await self.get_limit(queue, username)
+                
+                # 计算有效限制(考虑全局限制)
+                effective_hourly = acc_hourly
+                if effective_hourly == -1 or (global_hourly != -1 and global_hourly < effective_hourly):
+                    effective_hourly = global_hourly
+                    
+                effective_daily = acc_daily
+                if effective_daily == -1 or (global_daily != -1 and global_daily < effective_daily):
+                    effective_daily = global_daily
+                
+                accounts.append({
+                    "username": username,
+                    "hourly_usage": hourly,
+                    "daily_usage": daily,
+                    "hourly_limit": effective_hourly,
+                    "daily_limit": effective_daily
+                })
+                
+            stats[queue] = {
+                "global_hourly_limit": global_hourly,
+                "global_daily_limit": global_daily,
+                "accounts": accounts
+            }
+            
+        return stats
 
     async def mark_inactive(self, username: str, error_msg: str | None):
         qs = """
@@ -383,3 +610,48 @@ class AccountsPool:
         items = sorted(items, key=lambda x: x["active"], reverse=True)
         # items = sorted(items, key=lambda x: x["total_req"], reverse=True)
         return items
+
+    async def get_for_queue_or_wait(self, queue: str) -> Account | None:
+        msg_shown = False
+        while True:
+            account = await self.get_for_queue(queue)
+            if not account:
+                if self._raise_when_no_account or get_env_bool("TWS_RAISE_WHEN_NO_ACCOUNT"):
+                    raise NoAccountError(f"No account available for queue {queue}")
+
+                if not msg_shown:
+                    nat = await self.next_available_at(queue)
+                    if not nat:
+                        logger.warning("No active accounts. Stopping...")
+                        return None
+
+                    msg = f'No account available for queue "{queue}". Next available at {nat}'
+                    logger.info(msg)
+                    msg_shown = True
+
+                await asyncio.sleep(5)
+                continue
+            else:
+                if msg_shown:
+                    logger.info(f"Continuing with account {account.username} on queue {queue}")
+
+            return account
+
+    async def next_available_at(self, queue: str):
+        qs = f"""
+        SELECT json_extract(locks, '$."{queue}"') as lock_until
+        FROM accounts
+        WHERE active = true AND json_extract(locks, '$."{queue}"') IS NOT NULL
+        ORDER BY lock_until ASC
+        LIMIT 1
+        """
+        rs = await fetchone(self._db_file, qs)
+        if rs:
+            now, trg = utc.now(), utc.from_iso(rs[0])
+            if trg < now:
+                return "now"
+
+            at_local = datetime.now() + (trg - now)
+            return at_local.strftime("%H:%M:%S")
+
+        return None

@@ -372,124 +372,116 @@ API data limitations:
 - [snscrape](https://github.com/JustAnotherArchivist/snscrape) – is a scraper for social networking services (SNS)
 - [twint](https://github.com/twintproject/twint) – Twitter Intelligence Tool
 
-## 新功能
 
-### 私信和媒体上传
+自定义调用限制功能
+自定义调用限制功能允许您为账号池中的账号设置精确的 API 调用限制，包括全局限制和账号特定限制，以防止账号被 Twitter 限制或封禁。
+主要功能
+时间窗口限制：支持按小时和按天的调用频率限制
+账号特定限制：可以为特定账号设置不同的限制
+全局限制：可以为所有账号设置通用限制
+使用统计追踪：记录并查询每个账号的 API 调用频率
+自动清理：定期删除过期的使用记录
+自动检查：在分配账号前自动检查限制
 
-现在可以使用以下方法发送私信和上传媒体文件：
+工作原理
+数据库表:
+custom_limits: 存储队列和账号的限制配置
+usage_stats: 记录API调用的使用统计
+自动检查:
+当调用get_for_queue方法获取账号时，系统会自动调用_check_custom_limits检查账号是否满足限制
+如果账号超过限制，系统会尝试下一个可用账号
+使用记录:
+当账号完成任务返回池中时，unlock方法会自动记录使用情况
+使用量根据时间窗口（小时/天）进行统计
 
-```python
-# 发送简单私信
-await api.dm(text="你好", receivers=[1234567890])
 
-# 发送带图片的私信
-await api.dm(text="查看这张图片", receivers=[1234567890], media="path/to/image.jpg")
+## 设置限制
 
-# 内部上传媒体API（通常不需要直接调用）
-media_id = await api._upload_media(filename="path/to/media.jpg", is_dm=False)
-
-# 添加参数wait_for_account=True可以在没有可用账号时等待
-await api.dm(text="你好", receivers=[1234567890], wait_for_account=True)
-
-# 检查账号池状态
-account_status = await api.account_status()
-print(f"总账号数: {account_status['total']}")
-print(f"活跃账号数: {account_status['active']}")
-print(f"锁定情况: {account_status['locks']}")
-
-# 重置所有锁
-await api.reset_locks()
-
-# 不支持重置特定队列的锁
-```
-
-上传媒体支持以下格式：
-- 图片：JPG、PNG、GIF等 (最大5MB)
-- 动图：GIF (最大15MB)
-- 视频：MP4等 (最大530MB)
-
-注意：以上API都会自动使用账户池中的账户，并应用代理设置。
-
-#### 常见问题排查
-
-1. 如果收到错误 `AttributeError: 'QueueClient' object has no attribute 'post'`，请确保您使用的是最新版本的twscrape库。旧版本可能存在这个问题。
-
-2. 如果收到错误 `No account available for queue "useSendMessageMutation". Next available at 15:14:23`，表示所有账号都在冷却期。可以选择：
-   - 等待直到指定时间
-   - 添加更多账号到池中：`await api.pool.add_account(email, username, password)`
-   - 使用`wait_for_account=True`参数等待账号可用
-   - 使用`await api.reset_locks()`重置所有锁（谨慎使用，可能导致Twitter限制账号）
-
-3. 如果收到 `403 Forbidden` 错误，可能是账号没有私信权限或媒体上传权限。常见原因：
-   - 新账号可能需要验证手机号才能发送私信
-   - 账号被Twitter限制
-   - 媒体格式不受支持
-   - 目标用户的隐私设置不允许收到私信
-
-4. 为了避免上传错误，请确保：
-   - 媒体文件存在且可读
-   - 文件格式支持且未损坏
-   - 文件大小未超过限制
-   - 您的账号有权限发送私信和上传媒体
-
-5. 如果上传大文件时失败，可以尝试先压缩媒体文件再上传
-
-#### 完整示例：发送私信
-
-以下是一个检查账号状态、重置锁并发送私信的完整示例：
-
-```python
-import asyncio
+```import asyncio
 from twscrape import API
 
 async def main():
-    # 初始化API
-    api = API("accounts.db")  # 使用已有的账号数据库
-    api.debug = True  # 启用调试模式，查看详细日志
+    api = API("accounts.db")
     
-    # 检查账号状态
-    status = await api.account_status()
-    print(f"总账号数: {status['total']}")
-    print(f"活跃账号数: {status['active']}")
+    # 设置全局限制 (所有账号)
+    # 参数: 队列名, 每小时限制, 每日限制
+    await api.pool.set_limit("SearchTimeline", 30, 300)  # 30次/小时, 300次/天
     
-    if status['total'] == 0:
-        print("没有账号，需要添加账号")
-        await api.pool.add_account("your_email", "your_username", "your_password")
+    # 为特定账号设置限制
+    # 参数: 队列名, 每小时限制, 每日限制, 账号名
+    await api.pool.set_limit("SearchTimeline", 50, 500, "your_username")  # 50次/小时, 500次/天
     
-    # 如果所有账号都被锁定，重置锁
-    if 'useSendMessageMutation' in status['locks']:
-        print("检测到账号被锁定，正在重置...")
-        await api.reset_locks()
+    # -1 表示无限制
+    await api.pool.set_limit("UserTweets", -1, 1000)  # 无小时限制, 每天1000次
     
-    # 发送私信
-    try:
-        # 不带媒体的私信
-        dm_response = await api.dm(
-            text="你好，这是一条测试消息", 
-            receivers=[1234567890],  # 接收者ID
-            wait_for_account=True  # 如果没有账号可用，等待直到有账号可用
-        )
-        
-        if "error" in dm_response:
-            print(f"发送失败: {dm_response['error']}")
-        else:
-            print("私信发送成功!")
-            
-        # 带媒体的私信
-        dm_with_media = await api.dm(
-            text="查看这张图片", 
-            receivers=[1234567890],
-            media="path/to/image.jpg"
-        )
-        
-        if "error" in dm_with_media:
-            print(f"带媒体的私信发送失败: {dm_with_media['error']}")
-        else:
-            print("带媒体的私信发送成功!")
-            
-    except Exception as e:
-        print(f"发送私信时出错: {e}")
-
 if __name__ == "__main__":
-    asyncio.run(main())
-```
+    asyncio.run(main())```
+
+## 查询限制
+
+```async def check_limits():
+    api = API("accounts.db")
+    
+    # 获取全局限制
+    hourly_limit, daily_limit = await api.pool.get_limit("SearchTimeline")
+    print(f"全局限制: {hourly_limit}/小时, {daily_limit}/天")
+    
+    # 获取特定账号限制
+    hourly_limit, daily_limit = await api.pool.get_limit("SearchTimeline", "your_username")
+    print(f"账号限制: {hourly_limit}/小时, {daily_limit}/天")```
+
+## 查询使用统计
+
+```async def check_usage_stats():
+    api = API("accounts.db")
+    
+    # 获取所有队列的使用统计
+    stats = await api.pool.get_usage_stats()
+    
+    for queue, queue_stats in stats.items():
+        print(f"\n队列: {queue}")
+        print(f"全局限制: {queue_stats['global_hourly_limit']}/小时, {queue_stats['global_daily_limit']}/天")
+        
+        for account in queue_stats['accounts']:
+            print(f"  账号: {account['username']}")
+            print(f"    使用量: {account['hourly_usage']}/小时, {account['daily_usage']}/天")
+            print(f"    限制: {account['hourly_limit']}/小时, {account['daily_limit']}/天")```
+
+## 清理过期使用记录
+
+```async def cleanup_old_records():
+    api = API("accounts.db")
+    
+    # 删除7天前的使用记录
+    await api.pool.cleanup_usage_stats(days=7)
+    
+    # 可以自定义保留天数
+    # await api.pool.cleanup_usage_stats(days=30)  # 保留30天数据```
+
+
+## 高级用法
+
+### 重置所有锁
+
+```async def reset_all_locks():
+    api = API("accounts.db")
+    await api.pool.reset_locks()
+    print("已重置所有账号锁")```
+
+### 等待可用账号
+
+当所有账号都达到限制时，您可以使用get_for_queue_or_wait方法等待账号变为可用:
+
+```async def wait_for_account():
+    api = API("accounts.db")
+    
+    # 这将等待直到有账号可用
+    # 如果没有账号可用，会每5秒检查一次，直到有账号可用
+    account = await api.pool.get_for_queue_or_wait("SearchTimeline")
+    
+    if account:
+        print(f"获得可用账号: {account.username}")
+        # 使用账号...
+        
+        # 完成后释放账号
+        await api.pool.unlock(account.username, "SearchTimeline")```

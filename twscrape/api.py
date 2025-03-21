@@ -1017,7 +1017,7 @@ class API:
 
 # Experimental Features -------------------------------------------------------------------------------------------------------------
 
-    async def dm_alt(self, text: str, receivers: list[int] | int | str, media: str = None, wait_for_account=False):
+    async def dm_alt(self, text: str, receivers: list[int] | int | str, media: str = None, wait_for_account=False, return_username=False):
         """使用GraphQL发送私信的改进方法
         
         Args:
@@ -1025,6 +1025,7 @@ class API:
             receivers: 接收者用户ID列表、单个用户ID或字符串形式的ID
             media: 媒体文件路径(可选)
             wait_for_account: 如果没有可用账号，是否等待账号可用
+            return_username: 是否在返回结果中包含使用的账号用户名
             
         Returns:
             响应数据
@@ -1115,21 +1116,36 @@ class API:
                 error_messages = "; ".join([f"({e.get('code', 'unknown')}) {e.get('message', 'Unknown error')}" for e in errors])
                 if self.debug:
                     print(f"发送私信失败: {error_messages}")
-                return response_data
+                
+                # 添加账号用户名
+                result = response_data
+                if return_username and current_account:
+                    result = {**response_data, "username": current_account.username}
+                return result
             
             # 检查DM创建结果
             if "data" in response_data and "create_dm" in response_data["data"]:
                 create_dm = response_data["data"]["create_dm"]
                 if create_dm.get("__typename") == "CreateDmFailed":
-                    failure_type = create_dm.get("dm_validation_failure_type", "未知错误")
                     if self.debug:
                         print(f"发送失败，响应格式异常: {response_data}")
-                    return response_data
+                    
+                    # 添加账号用户名
+                    result = response_data
+                    if return_username and current_account:
+                        result = {**response_data, "username": current_account.username}
+                    return result
+            
             if self.debug:
                 print("私信发送成功")
-            return response_data
+                
+            # 添加账号用户名
+            result = response_data
+            if return_username and current_account:
+                result = {**response_data, "username": current_account.username}
+            return result
             
         except Exception as e:
             if self.debug:
                 print(f"发送私信时发生异常: {e}")
-            return {"error": f"发送私信时发生异常: {str(e)}"}
+            return {{str(e)}}

@@ -3,8 +3,8 @@ requires = ["hatchling>=1.9.1"]
 build-backend = "hatchling.build"
 
 [project]
-name = "twscrapeplus"
-version = "0.3.1"
+name = "omnitool"
+version = "0.3.3"
 authors = [{ name = "vladkens", email = "Richard@mail.com" }]
 description = "Twitter GraphQL and Search API implementation with SNScrape data models"
 readme = "readme.md"

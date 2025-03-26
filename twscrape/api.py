@@ -182,7 +182,7 @@ class API:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
     # 媒体上传方法
-    async def _upload_media(self, filename: str, is_dm: bool = False, is_profile=False, max_retries=2, callback_acc=None) -> int | None:
+    async def _upload_media(self, filename: str, is_dm: bool = False, is_profile=False, max_retries=3, callback_acc=None) -> int | None:
         """
         上传媒体文件到Twitter
         
@@ -1153,4 +1153,4 @@ class API:
         except Exception as e:
             if self.debug:
                 print(f"发送私信时发生异常: {e}")
-            return {{str(e)}}
+            return str(e)

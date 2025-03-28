@@ -219,7 +219,7 @@ class AccountsPool:
         if usernames is None:
             qs = "SELECT * FROM accounts WHERE active = false AND error_msg IS NULL"
         else:
-            us = ",".join([f'"{x}"' for x in usernames])
+            us = ",".join([f"'{x}'" for x in usernames])
             qs = f"SELECT * FROM accounts WHERE username IN ({us})"
 
         rs = await fetchall(self._db_file, qs)
@@ -248,8 +248,8 @@ class AccountsPool:
             error_msg = NULL,
             headers = json_object(),
             cookies = json_object(),
-            user_agent = "{UserAgent().safari}"
-        WHERE username IN ({",".join([f'"{x}"' for x in usernames])})
+            user_agent = '{UserAgent().safari}'
+        WHERE username IN ({",".join([f"'{x}'" for x in usernames])})
         """
 
         await execute(self._db_file, qs)

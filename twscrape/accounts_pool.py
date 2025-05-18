@@ -59,19 +59,32 @@ class AccountsPool:
         return False
 
     async def _init_custom_limits_tables(self):
-        """初始化自定义限制相关表"""
-        # 自定义限制表
-        await execute(self._db_file, """
+        """初始化自定义限制相关表，自动补全缺失字段"""
+        # 定义 custom_limits 表应有的字段
+        required_columns = [
+            {"name": "id", "type": "INTEGER PRIMARY KEY"},
+            {"name": "queue", "type": "TEXT"},
+            {"name": "username", "type": "TEXT DEFAULT '*'"},
+            {"name": "hourly_limit", "type": "INTEGER DEFAULT -1"},
+            {"name": "daily_limit", "type": "INTEGER DEFAULT -1"},
+            {"name": "is_exempt", "type": "BOOLEAN DEFAULT FALSE"},
+        ]
+
+        # 创建表（只会在表不存在时创建）
+        await execute(self._db_file, f"""
             CREATE TABLE IF NOT EXISTS custom_limits (
-                id INTEGER PRIMARY KEY,
-                queue TEXT,
-                username TEXT DEFAULT '*',
-                hourly_limit INTEGER DEFAULT -1,
-                daily_limit INTEGER DEFAULT -1,
+                {', '.join([f"{col['name']} {col['type']}" for col in required_columns])},
                 UNIQUE(queue, username)
-            )
-        """)
-        
+            )""")
+
+        # 检查并补全缺失字段
+        table_info = await fetchall(self._db_file, "PRAGMA table_info(custom_limits)")
+        existing_columns = {col['name'] for col in table_info}
+        for col in required_columns:
+            if col['name'] not in existing_columns:
+                await execute(self._db_file, f"ALTER TABLE custom_limits ADD COLUMN {col['name']} {col['type']}")
+                logger.info(f"Added missing '{col['name']}' column to 'custom_limits' table.")
+
         # 使用记录表
         await execute(self._db_file, """
             CREATE TABLE IF NOT EXISTS usage_stats (
@@ -398,7 +411,7 @@ class AccountsPool:
         # 通过所有限制检查
         return True
         
-    async def set_limit(self, queue: str, hourly_limit: int = -1, daily_limit: int = -1, username: str = '*'):
+    async def set_limit(self, queue: str, hourly_limit: int = -1, daily_limit: int = -1, username: str = '*', is_exempt: bool = False):
         """设置自定义限制
         
         Args:
@@ -406,14 +419,15 @@ class AccountsPool:
             hourly_limit: 每小时限制(-1表示无限制)
             daily_limit: 每日限制(-1表示无限制)
             username: 特定账号(*表示全局限制)
+            is_exempt: 此限制是否豁免全局默认限制的更改
         """
         await execute(
             self._db_file,
             """INSERT OR REPLACE INTO custom_limits 
-               (queue, username, hourly_limit, daily_limit) VALUES (?, ?, ?, ?)""",
-            (queue, username, hourly_limit, daily_limit)
+               (queue, username, hourly_limit, daily_limit, is_exempt) VALUES (?, ?, ?, ?, ?)""",
+            (queue, username, hourly_limit, daily_limit, is_exempt)
         )
-        logger.info(f"为 {queue} 队列设置限制 - 账号: {username}, 小时: {hourly_limit}, 每日: {daily_limit}")
+        logger.info(f"为 {queue} 队列设置限制 - 账号: {username}, 小时: {hourly_limit}, 每日: {daily_limit}, 豁免: {is_exempt}")
 
     async def get_limit(self, queue: str, username: str = '*'):
         """获取限制设置
@@ -554,6 +568,48 @@ class AccountsPool:
             }
             
         return stats
+
+    async def set_global_default_limit(self, queue: str, hourly_limit: int = -1, daily_limit: int = -1):
+        """
+        设置全局默认限制，并更新所有非豁免的账户特定限制。
+        """
+        # 1. 设置或更新全局默认限制 (username = '*')
+        # 全局默认限制本身不应被视为豁免，以便它们可以被新的全局默认值更新
+        await self.set_limit(queue, hourly_limit, daily_limit, username='*', is_exempt=False)
+
+        # 2. 更新所有非豁免的账户特定限制以匹配新的全局默认值
+        # 注意：is_exempt 为 FALSE (0) 的记录才会被更新
+        update_non_exempt_sql = """
+            UPDATE custom_limits
+            SET hourly_limit = ?, daily_limit = ?
+            WHERE queue = ? AND username != '*' AND is_exempt = 0
+        """
+        await execute(
+            self._db_file,
+            update_non_exempt_sql,
+            (hourly_limit, daily_limit, queue)
+        )
+        logger.info(f"全局默认限制已为队列 {queue} 设置为 小时: {hourly_limit}, 每日: {daily_limit}，并更新了非豁免账户的限制。")
+
+    async def force_set_all_accounts_limit(self, queue: str, hourly_limit: int = -1, daily_limit: int = -1):
+        """
+        强制为所有账户设置指定队列的限制，覆盖现有设置。
+        这些强制设置的限制将标记为非豁免 (is_exempt = False)。
+        """
+        # 1. 获取所有账户的用户名
+        accounts_rs = await fetchall(self._db_file, "SELECT username FROM accounts")
+        if not accounts_rs:
+            logger.warning("系统中没有账户，无法强制设置限制。")
+            return
+
+        usernames = [row["username"] for row in accounts_rs]
+
+        # 2. 为每个账户设置限制
+        # 强制设置，所以 is_exempt 为 False，确保它们可以被未来的全局默认更改所覆盖，除非之后单独修改
+        for username in usernames:
+            await self.set_limit(queue, hourly_limit, daily_limit, username=username, is_exempt=False)
+        
+        logger.info(f"已为队列 {queue} 强制为所有 {len(usernames)} 个账户设置限制: 小时: {hourly_limit}, 每日: {daily_limit}。")
 
     async def mark_inactive(self, username: str, error_msg: str | None):
         qs = """
